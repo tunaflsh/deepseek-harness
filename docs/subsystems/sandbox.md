@@ -38,6 +38,22 @@ Enforcement is a reported fact. `full` means the backend governs every file effe
 type SandboxEnforcement = 'full' | 'partial'
 ```
 
+On Linux a confined run lands on one of three enforcement levels:
+
+| Level | File effects | Local IPC |
+| --- | --- | --- |
+| `bwrap` (default) | enforced by mounts | masked: gpg and ssh agents, the session bus, and container and VM daemons are unreachable |
+| Landlock (fallback) | enforced by the kernel LSM | reachable: a confined command can use those services |
+| `danger-full-access` (approval-gated) | unconfined | reachable |
+
+The bwrap profile replaces the gpg socket directory with an empty read-only
+tmpfs, and binds `SSH_AUTH_SOCK`, legacy GnuPG-agent sockets, the per-user
+session bus, and the Docker, Podman, containerd and libvirt sockets to
+`/dev/null`. A command that needs one of those services fails while the service
+keeps running on the host; approve `danger-full-access` when the user wants that
+access. Install bubblewrap and allow unprivileged user namespaces to keep the
+masked level on a host where only Landlock runs.
+
 ## Per-call policy
 
 The complete execution policy is resolved and carried per capability call. It includes `danger-full-access` so a consumer can resolve policy once before deciding whether to bypass confinement. Normal tool calls derive `workspaceRoot` from the calling session's immutable cwd; deployment configuration supplies the agentless fallback and explicit additional write grants. The resolver preserves absolute execution-world spelling. Enforcing providers canonicalize the root where the files exist, so a cwd containing `symlink/..` identifies the directory where the paired subprocess provider actually runs.

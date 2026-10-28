@@ -4,17 +4,72 @@
  * @module @deepseek-ai/dsh-sandbox-local/profiles
  */
 
+import { existsSync } from 'node:fs'
 import { grantArgs as landlockGrantArgs } from '@deepseek-ai/node-addon-system/landlock-run'
 import { workspaceWritableRoots, writableRoots } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 
+/** Container and VM daemons that grant unauthenticated host authority on the caller. */
+const HOST_DAEMON_SOCKETS = [
+  '/var/run/docker.sock',
+  '/run/docker.sock',
+  '/run/podman/podman.sock',
+  '/var/run/podman/podman.sock',
+  '/run/containerd/containerd.sock',
+  '/run/libvirt/libvirt-sock',
+]
+
+/** The per-user runtime directory. */
+function runtimeDirectory(env: NodeJS.ProcessEnv): string {
+  /* v8 ignore next -- bwrap exists only where process.getuid does */
+  return env.XDG_RUNTIME_DIR ?? `/run/user/${process.getuid?.() ?? 0}`
+}
+
 /**
- * Build the bwrap profile arguments for one file-effect policy.
+ * Agent sockets named by the environment: `SSH_AUTH_SOCK`, and legacy homedir
+ * sockets (GnuPG before 2.1.13).
+ */
+function credentialSockets(env: NodeJS.ProcessEnv): string[] {
+  const paths: string[] = []
+  const add = (path: string | undefined): void => {
+    if (path !== undefined && path.startsWith('/')) paths.push(path)
+  }
+  add(env.SSH_AUTH_SOCK)
+  const gnupg = env.GNUPGHOME
+  if (gnupg !== undefined && gnupg.startsWith('/')) {
+    for (const name of ['S.gpg-agent', 'S.gpg-agent.extra', 'S.gpg-agent.ssh', 'S.keyboxd', 'S.scdaemon']) add(`${gnupg}/${name}`)
+  }
+  return paths
+}
+
+/** Session-bus sockets: the standard per-user path and any environment override. */
+function sessionBusSockets(env: NodeJS.ProcessEnv): string[] {
+  const paths: string[] = []
+  paths.push(`${runtimeDirectory(env)}/bus`)
+  const bus = /(?:^|;)unix:path=([^;,]+)/u.exec(env.DBUS_SESSION_BUS_ADDRESS ?? '')
+  if (bus === null) return paths
+  /* v8 ignore next -- the capture group matches at least one character, so it cannot be undefined */
+  if (bus[1] !== undefined) paths.push(bus[1])
+  return paths
+}
+
+/**
+ * Build the bwrap profile arguments for one file-effect policy and local IPC masking.
+ *
  * @param policy - file-effect policy to express as bwrap mounts.
  * @returns profile arguments before the trailing separator and command argv.
  */
 export function bwrapProfileArgs(policy: SandboxPolicy): string[] {
   const args = ['--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent']
+  const gnupg = `${runtimeDirectory(process.env)}/gnupg`
+  if (existsSync(gnupg)) args.push('--tmpfs', gnupg, '--remount-ro', gnupg)
+  const masked = new Set<string>()
+  for (const socket of [...credentialSockets(process.env), ...sessionBusSockets(process.env), ...HOST_DAEMON_SOCKETS]) {
+    if (socket.startsWith(`${gnupg}/`)) continue
+    if (masked.has(socket) || !existsSync(socket)) continue
+    masked.add(socket)
+    args.push('--ro-bind', '/dev/null', socket)
+  }
   if (policy.mode === 'workspace-write') {
     args.push('--tmpfs', '/tmp')
     for (const root of workspaceWritableRoots(policy)) args.push('--bind', root, root)

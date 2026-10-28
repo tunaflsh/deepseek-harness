@@ -22,6 +22,18 @@ import {
 import type { Config } from '@deepseek-ai/dsh-sandbox-local'
 import { bwrapProfileArgs, landlockProfileArgs, seatbeltProfileArgs } from '../src/profiles.ts'
 
+/**
+ * The paths the mocked existence probe reports. Host state is never consulted,
+ * so exact-argv assertions do not depend on whether this machine runs Docker or
+ * gpg-agent; masking tests seed this set.
+ */
+const fsState = vi.hoisted(() => ({ fake: new Set<string>() }))
+
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs')>()
+  return { ...actual, existsSync: (path: string) => fsState.fake.has(path) }
+})
+
 const RO: SandboxPolicy = { mode: 'read-only', workspaceRoot: '/ws' }
 const WW: SandboxPolicy = { mode: 'workspace-write', workspaceRoot: '/ws' }
 
@@ -29,6 +41,8 @@ const WW: SandboxPolicy = { mode: 'workspace-write', workspaceRoot: '/ws' }
 const tempDirs: string[] = []
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true })
+  fsState.fake.clear()
+  vi.unstubAllEnvs()
 })
 
 async function setup(config: Config = {}, internals: LocalSandboxProvider['internals'] = {}) {
@@ -82,6 +96,76 @@ describe('profile dialects', () => {
       '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent',
       '--tmpfs', '/tmp', '--bind', '/ws', '/ws',
     ])
+  })
+
+  it('bwrap masks the gpg socket directory read-only, before writable mounts', () => {
+    vi.stubEnv('XDG_RUNTIME_DIR', '/run/user/1000')
+    fsState.fake.add('/run/user/1000/gnupg')
+    expect(bwrapProfileArgs(WW)).toEqual([
+      '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent',
+      '--tmpfs', '/run/user/1000/gnupg', '--remount-ro', '/run/user/1000/gnupg',
+      '--tmpfs', '/tmp', '--bind', '/ws', '/ws',
+    ])
+  })
+
+  it('masks agent, bus and daemon sockets named by the environment', () => {
+    vi.stubEnv('XDG_RUNTIME_DIR', '/run/user/1000')
+    vi.stubEnv('SSH_AUTH_SOCK', '/run/ssh-unix-local/socket')
+    vi.stubEnv('DBUS_SESSION_BUS_ADDRESS', 'unix:path=/run/user/1000/bus,guid=abc')
+    vi.stubEnv('GNUPGHOME', '/home/u/.gnupg')
+    for (const path of [
+      '/run/user/1000/gnupg',
+      '/run/user/1000/gnupg/S.gpg-agent.ssh',
+      '/run/ssh-unix-local/socket',
+      '/run/user/1000/bus',
+      '/home/u/.gnupg/S.gpg-agent',
+      '/var/run/docker.sock',
+    ]) fsState.fake.add(path)
+    expect(bwrapProfileArgs(WW)).toEqual([
+      '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent',
+      '--tmpfs', '/run/user/1000/gnupg', '--remount-ro', '/run/user/1000/gnupg',
+      '--ro-bind', '/dev/null', '/run/ssh-unix-local/socket',
+      '--ro-bind', '/dev/null', '/home/u/.gnupg/S.gpg-agent',
+      '--ro-bind', '/dev/null', '/run/user/1000/bus',
+      '--ro-bind', '/dev/null', '/var/run/docker.sock',
+      '--tmpfs', '/tmp', '--bind', '/ws', '/ws',
+    ])
+  })
+
+  it('ignores relative agent paths and a non-unix bus address', () => {
+    const previous = process.env.XDG_RUNTIME_DIR
+    delete process.env.XDG_RUNTIME_DIR
+    vi.stubEnv('SSH_AUTH_SOCK', 'relative/socket')
+    vi.stubEnv('GNUPGHOME', 'relative-gnupg')
+    vi.stubEnv('DBUS_SESSION_BUS_ADDRESS', 'tcp:host=127.0.0.1')
+    try {
+      expect(bwrapProfileArgs(RO)).toEqual(['--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent'])
+    } finally {
+      if (previous === undefined) delete process.env.XDG_RUNTIME_DIR
+      else process.env.XDG_RUNTIME_DIR = previous
+    }
+  })
+
+  it('drops an agent socket inside the masked gpg directory', () => {
+    vi.stubEnv('XDG_RUNTIME_DIR', '/run/user/1000')
+    vi.stubEnv('SSH_AUTH_SOCK', '/run/user/1000/gnupg/S.gpg-agent.ssh')
+    fsState.fake.add('/run/user/1000/gnupg')
+    fsState.fake.add('/run/user/1000/gnupg/S.gpg-agent.ssh')
+    expect(bwrapProfileArgs(RO)).toEqual([
+      '--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent',
+      '--tmpfs', '/run/user/1000/gnupg', '--remount-ro', '/run/user/1000/gnupg',
+    ])
+  })
+
+  it('ignores an unset session-bus address', () => {
+    const previous = process.env.DBUS_SESSION_BUS_ADDRESS
+    delete process.env.DBUS_SESSION_BUS_ADDRESS
+    try {
+      expect(bwrapProfileArgs(RO)).toEqual(['--ro-bind', '/', '/', '--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent'])
+    } finally {
+      if (previous === undefined) delete process.env.DBUS_SESSION_BUS_ADDRESS
+      else process.env.DBUS_SESSION_BUS_ADDRESS = previous
+    }
   })
 
   it('landlock read-only: readable tree plus a writable /dev/null, nothing else', () => {
@@ -535,6 +619,8 @@ describe('the windows-acl probe (runner invocation contract)', () => {
     tempDirs.push(dir)
     const builtEntry = join(dir, 'runner.js')
     writeFileSync(builtEntry, '')
+    // The mocked existence probe is fake-only: report the file just written.
+    fsState.fake.add(builtEntry)
     const { sandbox } = await setup({}, {
       chain: ['windows-acl', 'bwrap'],
       probeWindowsAcl: () => true,
